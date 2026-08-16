@@ -28,11 +28,11 @@
 // Zero dependencies. Usage:  node check.mjs [repo-root]
 
 import { spawnSync } from 'node:child_process'
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync, existsSync, readFileSync, readdirSync, symlinkSync, appendFileSync, statSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, existsSync, readFileSync, readdirSync, symlinkSync, appendFileSync, realpathSync } from 'node:fs'
 import { join, dirname, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 
-const ROOT = resolve(process.argv[2] ?? '.')
+const ROOT = realpathSync(resolve(process.argv[2] ?? '.'))
 const TIMEOUT = Number(process.env.VIMPRO_CHECK_TIMEOUT_MS ?? 60000)
 // fail-on: 'abort' (only a dead init fails) or 'error' (any init error fails)
 const FAIL_ON = process.env.VIMPRO_CHECK_FAIL_ON === 'abort' ? 'abort' : 'error'
@@ -82,15 +82,20 @@ export function scoutPlugins(root, paths) {
     if (/vim\.pack\.add\b/.test(text)) manager = 'vim.pack'
     // github URLs are unambiguous wherever they appear
     for (const m of text.matchAll(/https:\/\/github\.com\/([\w.-]+\/[\w.-]+?)(?:\.git)?['"]/g)) plugins.add(m[1])
-    // owner/repo strings, but only in files that look like spec files — a
-    // quoted pair anywhere would drag in LSP method names and worse
-    if (/(^|\/)plugins?\//.test(p) || /(^|\/)plugins?\.lua$/.test(p) || /require\s*\(\s*['"]lazy['"]\s*\)\.setup|vim\.pack\.add/.test(text)) {
-      for (const m of text.matchAll(/['"]([A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*)['"]/g)) {
-        const name = m[1]
-        if (/^textDocument\//.test(name) || /\s/.test(name)) continue
-        if (name.split('/')[1]?.includes('.') && !/\.(nvim|vim|lua)$/.test(name)) continue
-        plugins.add(name)
-      }
+    // owner/repo strings from EVERY lua file. The first version gated on
+    // spec-looking paths and missed lua/theprimeagen/lazy/ entirely, which
+    // left lazy to network-install thirty plugins inside the measured boot —
+    // a 29-second startup that was really a download. Junk is filtered by
+    // shape instead: github owners cannot contain dots, path-fragment
+    // lookalikes (plugin/30_mini.lua, tests/screenshots) fail the owner or
+    // repo shape, and whatever survives wrongly just fails one bounded clone
+    // and lands in the unprovisioned warning, which is the visible direction.
+    for (const m of text.matchAll(/['"]([A-Za-z0-9][A-Za-z0-9-]*\/[A-Za-z0-9][\w.-]*)['"]/g)) {
+      const [owner, repo] = m[1].split('/')
+      if (/^(textDocument|tags|tests|plugin|plugins|lua|after|doc|custom|scripts)$/.test(owner)) continue
+      if (/^\d/.test(repo) || /\s/.test(m[1])) continue
+      if (repo.includes('.') && !/\.(nvim|vim)$/.test(repo)) continue
+      plugins.add(m[1])
     }
     for (const m of text.matchAll(/Plug\s+['"]([\w.-]+\/[\w.-]+)['"]/g)) { plugins.add(m[1]); manager = manager ?? 'vim-plug' }
   }
@@ -136,7 +141,12 @@ export function classifyStderr(text) {
     const line = raw.trimEnd()
     if (!line.trim()) continue
     if (/^vim\.pack: Repaired corrupted lock data/.test(line.trim())) continue
-    if (CONTINUATION.test(line) && (inError ? errors.length : notices.length)) {
+    // an error line ending in ':' has said WHERE but not WHAT — the next line
+    // is its message body whatever its shape ('No specs found for module …'
+    // matches none of the continuation forms, and losing the body turns a
+    // diagnosable failure into 'Error in init.lua:' full stop)
+    const owed = inError && errors.length && errors[errors.length - 1].endsWith(':')
+    if ((CONTINUATION.test(line) || (owed && !ERROR_START.test(line.trim()))) && (inError ? errors.length : notices.length)) {
       if (inError && errors.length && errors[errors.length - 1].split('\n').length < 3) {
         errors[errors.length - 1] += '\n' + line.trim()
       }
@@ -189,7 +199,14 @@ export async function runCheck(root = ROOT) {
 
     const dataDir = join(work, 'data')
     const provisioned = [], unprovisioned = []
+    const seen = new Set()
     for (const { name, dest } of provisionPlan(scout.manager, scout.plugins, dataDir)) {
+      // one destination, one clone: the scout finds folke/lazy.nvim in the
+      // bootstrap AND the plan prepends it, and the second clone into the
+      // same non-empty directory failed as a spurious warning on every
+      // single lazy config in the corpus
+      if (seen.has(dest)) continue
+      seen.add(dest)
       if (!/^[\w.-]+\/[\w.-]+$/.test(name)) { unprovisioned.push(name); continue }
       mkdirSync(dirname(dest), { recursive: true })
       const r = git(['clone', '--quiet', '--depth', '1', '--no-tags', '--recurse-submodules=no',
@@ -220,8 +237,16 @@ export async function runCheck(root = ROOT) {
         errors: [`the editor did not finish booting within ${Math.round(TIMEOUT / 1000)}s`], notices: [] }
     }
 
-    const { errors, notices } = classifyStderr(
-      (r.stderr ?? '').replaceAll(root + '/', '').replaceAll(work + '/', ''))
+    // both spellings of both roots: macOS reports /private/var for paths that
+    // mkdtemp handed us as /var, and a half-scrubbed path reads as gibberish
+    let scrubbed = r.stderr ?? ''
+    for (const base of [root, work]) {
+      for (const variant of [base, realpathSync(base), '/private' + base]) {
+        scrubbed = scrubbed.replaceAll(variant + '/', '')
+      }
+    }
+    if (process.env.VIMPRO_CHECK_DEBUG) console.error('── raw stderr ──\n' + scrubbed + '\n── end raw ──')
+    const { errors, notices } = classifyStderr(scrubbed)
     const aborted = errors.some((e) => /^E5113|Error detected while processing|E5108/.test(e))
     const marker = (r.stdout ?? '').split('\n').reverse().find((l) => l.startsWith('VIMPRO_CHECK '))
     let dumped = null
@@ -276,7 +301,7 @@ if (isMain) {
     try { appendFileSync(process.env.GITHUB_STEP_SUMMARY, md + '\n') } catch { /* best effort */ }
   }
   if (!ok) {
-    for (const e of res.errors ?? []) console.log(`::error title=vim.pro check::${e.split('\n')[0]}`)
+    for (const e of res.errors ?? []) console.log(`::error title=vim.pro check::${e.replaceAll('%', '%25').replaceAll('\n', '%0A')}`)
     process.exit(1)
   }
 }
