@@ -1,0 +1,39 @@
+# CI for your editor. Add to your dotfiles repo:
+#
+#   name: vim.pro check
+#   on: [push, pull_request]
+#   jobs:
+#     check:
+#       runs-on: ubuntu-latest
+#       steps:
+#         - uses: actions/checkout@v4
+#         - uses: vim-pro/check@v1
+#
+# Boots your nvim config on the runner — a genuinely clean machine — with your
+# declared plugins provisioned, and fails the build if the editor fails. The
+# error that stops your init is quoted in the annotation, not summarized.
+name: 'vim.pro check'
+description: 'Boot your nvim config on a clean machine and fail the build if the editor fails.'
+branding:
+  icon: 'check-circle'
+  color: 'green'
+inputs:
+  nvim-version:
+    description: 'Neovim version to boot with (stable, nightly, or a tag like v0.12.4)'
+    required: false
+    default: 'stable'
+  fail-on:
+    description: 'What fails the build: "error" (any init error) or "abort" (only a dead init)'
+    required: false
+    default: 'error'
+runs:
+  using: 'composite'
+  steps:
+    - uses: rhysd/action-setup-vim@v1
+      with:
+        neovim: true
+        version: ${{ inputs.nvim-version }}
+    - run: node "$GITHUB_ACTION_PATH/check.mjs" "$GITHUB_WORKSPACE"
+      shell: bash
+      env:
+        VIMPRO_CHECK_FAIL_ON: ${{ inputs.fail-on }}

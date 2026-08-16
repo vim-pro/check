@@ -1,0 +1,282 @@
+#!/usr/bin/env node
+// vim.pro check — CI for your editor.
+//
+// Your code gets a test suite; your editor config gets pushed and prayed
+// over. This runs in your dotfiles repo — locally or as a GitHub Action —
+// and answers the question nothing in the ecosystem answers: does this
+// config actually BOOT on a machine that is not yours?
+//
+//   - finds your nvim config in the repo, whatever the layout (bare repo,
+//     .config/nvim, chezmoi's dot_config, stow's aspects/…)
+//   - provisions your declared plugins the way your manager expects them,
+//     so the editor never wants the network
+//   - boots it, headless, and reads what actually happened: startup time
+//     from nvim's own clock, real init errors with their traces folded in,
+//     what loaded
+//   - fails the build when the editor fails, with the error quoted
+//
+// The engine is ported from vim.pro's worker (github.com/vim-pro/vim.pro),
+// where it boots every connected config — this is the same measurement, run
+// where your pull requests live, against the commit being proposed rather
+// than whatever the site last synced.
+//
+// Confinement note: the site's worker runs untrusted strangers' configs and
+// sandboxes accordingly. Here the config is YOURS and the machine is an
+// ephemeral CI runner (or your own), so the posture is lighter — but the
+// editor still gets a scrubbed env, no shell, and a hard timeout.
+//
+// Zero dependencies. Usage:  node check.mjs [repo-root]
+
+import { spawnSync } from 'node:child_process'
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, existsSync, readFileSync, readdirSync, symlinkSync, appendFileSync, statSync } from 'node:fs'
+import { join, dirname, resolve } from 'node:path'
+import { tmpdir } from 'node:os'
+
+const ROOT = resolve(process.argv[2] ?? '.')
+const TIMEOUT = Number(process.env.VIMPRO_CHECK_TIMEOUT_MS ?? 60000)
+// fail-on: 'abort' (only a dead init fails) or 'error' (any init error fails)
+const FAIL_ON = process.env.VIMPRO_CHECK_FAIL_ON === 'abort' ? 'abort' : 'error'
+
+// ── find the config ────────────────────────────────────────────────────────
+// The entry file is init.lua/init.vim in a directory named nvim — which covers
+// a bare config repo (init.lua at root of a dir named anything? no: the repo
+// IS ~/.config/nvim, so the entry sits at the top), .config/nvim, chezmoi's
+// dot_config/nvim, and stow layouts like aspects/nvim/.config/nvim. A vimrc at
+// the repo root is the legacy shape and boots via -u.
+function walk(dir, out = [], depth = 0) {
+  if (depth > 6) return out
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    if (e.name === '.git' || e.name === 'node_modules') continue
+    const p = join(dir, e.name)
+    if (e.isDirectory()) walk(p, out, depth + 1)
+    else out.push(p.slice(ROOT.length + 1))
+  }
+  return out
+}
+
+export function findEntry(paths) {
+  const inits = paths.filter((p) => /(^|\/)init\.(lua|vim)$/.test(p))
+  // a dir literally named nvim (or dot_config/nvim etc.) wins; a bare config
+  // repo has init.lua at the top with lua/ beside it
+  const inNvimDir = inits.filter((p) => /(^|\/|dot_)nvim\/init\.(lua|vim)$/.test(dirname(p) + '/init.x') || /nvim$/.test(dirname(p)))
+  const bare = inits.find((p) => !p.includes('/'))
+  const chosen = inNvimDir.sort((a, b) => a.length - b.length)[0] ?? bare ?? inits.sort((a, b) => a.length - b.length)[0]
+  if (chosen) return { entry: chosen, legacy: false }
+  const vimrc = paths.find((p) => /^\.?g?vimrc$/.test(p))
+  return vimrc ? { entry: vimrc, legacy: true } : null
+}
+
+// ── read the declarations, lightly ─────────────────────────────────────────
+// The site's parser is a real parser; this is a scout. It only has to find
+// enough to PROVISION — a plugin it misses shows up honestly in the boot
+// report as a module the editor could not find, rather than being silently
+// fine, so the failure direction is visible, not wrong.
+export function scoutPlugins(root, paths) {
+  const plugins = new Set()
+  let manager = null
+  const luaFiles = paths.filter((p) => p.endsWith('.lua')).slice(0, 200)
+  for (const p of luaFiles) {
+    let text = ''
+    try { text = readFileSync(join(root, p), 'utf8') } catch { continue }
+    if (/lazypath|require\s*\(\s*['"]lazy['"]\s*\)/.test(text)) manager = manager ?? 'lazy.nvim'
+    if (/vim\.pack\.add\b/.test(text)) manager = 'vim.pack'
+    // github URLs are unambiguous wherever they appear
+    for (const m of text.matchAll(/https:\/\/github\.com\/([\w.-]+\/[\w.-]+?)(?:\.git)?['"]/g)) plugins.add(m[1])
+    // owner/repo strings, but only in files that look like spec files — a
+    // quoted pair anywhere would drag in LSP method names and worse
+    if (/(^|\/)plugins?\//.test(p) || /(^|\/)plugins?\.lua$/.test(p) || /require\s*\(\s*['"]lazy['"]\s*\)\.setup|vim\.pack\.add/.test(text)) {
+      for (const m of text.matchAll(/['"]([A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*)['"]/g)) {
+        const name = m[1]
+        if (/^textDocument\//.test(name) || /\s/.test(name)) continue
+        if (name.split('/')[1]?.includes('.') && !/\.(nvim|vim|lua)$/.test(name)) continue
+        plugins.add(name)
+      }
+    }
+    for (const m of text.matchAll(/Plug\s+['"]([\w.-]+\/[\w.-]+)['"]/g)) { plugins.add(m[1]); manager = manager ?? 'vim-plug' }
+  }
+  if (existsSync(join(root, '.gitmodules'))) {
+    const gm = readFileSync(join(root, '.gitmodules'), 'utf8')
+    if (/(^|\/)pack\/[^/\n]+\/(start|opt)\//m.test(gm)) manager = manager ?? 'native packages'
+  }
+  return { manager, plugins: [...plugins] }
+}
+
+// ── provisioning (ported from vim.pro worker/boot.mjs) ─────────────────────
+export function provisionPlan(manager, plugins, dataDir) {
+  const dirOf = (name) => String(name).split('/').pop()
+  const std = join(dataDir, 'nvim')   // stdpath('data') is $XDG_DATA_HOME/nvim
+  if (manager === 'lazy.nvim') {
+    return [
+      { name: 'folke/lazy.nvim', dest: join(std, 'lazy', 'lazy.nvim') },
+      ...plugins.map((p) => ({ name: p, dest: join(std, 'lazy', dirOf(p)) })),
+    ]
+  }
+  if (manager === 'vim.pack') {
+    return plugins.map((p) => ({ name: p, dest: join(std, 'site', 'pack', 'core', 'opt', dirOf(p)) }))
+  }
+  return []   // native packages ride the repo's own submodules; unknown managers provision nothing
+}
+
+function git(args, { timeoutMs = 120000, cwd } = {}) {
+  return spawnSync('git', args, {
+    timeout: timeoutMs, killSignal: 'SIGKILL', encoding: 'utf8', cwd,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+  })
+}
+
+// ── stderr classification (ported) ─────────────────────────────────────────
+// One error is one error, however many lines its trace takes; download chatter
+// is a notice, never an error.
+const ERROR_START = /^(E\d+|.*E\d+:|Error|error:|.*Error detected|Failed |fatal:)/
+const CONTINUATION = /^(\s|no file |no field |\[C\]:|stack traceback|\.\.\.|\t)/
+export function classifyStderr(text) {
+  const errors = [], notices = []
+  let inError = false
+  for (const raw of String(text ?? '').split('\n')) {
+    const line = raw.trimEnd()
+    if (!line.trim()) continue
+    if (/^vim\.pack: Repaired corrupted lock data/.test(line.trim())) continue
+    if (CONTINUATION.test(line) && (inError ? errors.length : notices.length)) {
+      if (inError && errors.length && errors[errors.length - 1].split('\n').length < 3) {
+        errors[errors.length - 1] += '\n' + line.trim()
+      }
+      continue
+    }
+    if (ERROR_START.test(line.trim())) { errors.push(line.trim()); inError = true }
+    else { notices.push(line.trim()); inError = false }
+  }
+  return { errors: errors.slice(0, 12), notices: notices.slice(0, 30) }
+}
+
+const DUMP_LUA = `
+local out = {}
+local _v = vim.version()
+out.nvim = string.format('%d.%d.%d', _v.major, _v.minor, _v.patch)
+local loaded = {}
+for _, p in ipairs(vim.api.nvim_list_runtime_paths()) do
+  local name = p:match('/pack/[^/]+/[^/]+/([^/]+)/?$') or p:match('/lazy/([^/]+)/?$')
+  if name and name ~= 'lazy.nvim' then loaded[name] = true end
+end
+out.plugins_loaded = vim.fn.sort(vim.tbl_keys(loaded))
+io.stdout:write('\\nVIMPRO_CHECK ' .. vim.json.encode(out) .. '\\n')
+`
+
+// ── the check ──────────────────────────────────────────────────────────────
+export async function runCheck(root = ROOT) {
+  const paths = walk(root)
+  const found = findEntry(paths)
+  if (!found) return { skip: 'no vim config found in this repository' }
+  const { entry, legacy } = found
+
+  const scout = scoutPlugins(root, paths)
+  const work = mkdtempSync(join(tmpdir(), 'vimpro-check-'))
+  try {
+    const xdgConfig = join(work, 'config')
+    mkdirSync(xdgConfig, { recursive: true })
+    if (!legacy) symlinkSync(join(root, dirname(entry)), join(xdgConfig, 'nvim'))
+
+    // native packages: make sure the config dir's submodules are actually
+    // present — on a fresh CI checkout they are not, unless the workflow asked
+    // for them. Shallow first, full on failure, https whatever .gitmodules says.
+    if (existsSync(join(root, '.gitmodules')) && !legacy) {
+      const sub = (extra) => git(['-c', 'url.https://github.com/.insteadOf=git@github.com:',
+        '-C', root, 'submodule', 'update', '--init', '--jobs', '4', ...extra, '--', dirname(entry)], { timeoutMs: 180000 })
+      let sm = sub(['--depth', '1'])
+      if (sm.error || sm.status !== 0) sm = sub([])
+      // a submodule that still fails will show up in the boot as a missing
+      // module, which is the honest place for it
+    }
+
+    const dataDir = join(work, 'data')
+    const provisioned = [], unprovisioned = []
+    for (const { name, dest } of provisionPlan(scout.manager, scout.plugins, dataDir)) {
+      if (!/^[\w.-]+\/[\w.-]+$/.test(name)) { unprovisioned.push(name); continue }
+      mkdirSync(dirname(dest), { recursive: true })
+      const r = git(['clone', '--quiet', '--depth', '1', '--no-tags', '--recurse-submodules=no',
+        `https://github.com/${name}.git`, dest], { timeoutMs: 60000 })
+      if (r.status === 0) provisioned.push(name)
+      else unprovisioned.push(name)
+    }
+
+    const dump = join(work, 'dump.lua')
+    writeFileSync(dump, DUMP_LUA)
+    const stFile = join(work, 'startuptime.log')
+    const args = ['--headless', '-n', '-i', 'NONE', '--startuptime', stFile,
+      '--cmd', 'set shell=/bin/false shellcmdflag=']
+    if (legacy) args.push('-u', join(root, entry))
+    args.push('-c', `luafile ${dump}`, '-c', 'qa!')
+
+    const r = spawnSync('nvim', args, {
+      timeout: TIMEOUT, killSignal: 'SIGKILL', encoding: 'utf8', maxBuffer: 8 << 20,
+      env: {
+        PATH: process.env.PATH, HOME: work, TMPDIR: work, TERM: 'dumb', LANG: 'C.UTF-8',
+        XDG_CONFIG_HOME: xdgConfig, XDG_DATA_HOME: dataDir,
+        XDG_STATE_HOME: join(work, 'state'), XDG_CACHE_HOME: join(work, 'cache'),
+      },
+    })
+    if (r.error?.code === 'ENOENT') return { skip: 'nvim is not installed on this runner' }
+    if (r.error?.code === 'ETIMEDOUT' || r.signal) {
+      return { entry, manager: scout.manager, provisioned, unprovisioned, aborted: true,
+        errors: [`the editor did not finish booting within ${Math.round(TIMEOUT / 1000)}s`], notices: [] }
+    }
+
+    const { errors, notices } = classifyStderr(
+      (r.stderr ?? '').replaceAll(root + '/', '').replaceAll(work + '/', ''))
+    const aborted = errors.some((e) => /^E5113|Error detected while processing|E5108/.test(e))
+    const marker = (r.stdout ?? '').split('\n').reverse().find((l) => l.startsWith('VIMPRO_CHECK '))
+    let dumped = null
+    try { dumped = marker ? JSON.parse(marker.slice('VIMPRO_CHECK '.length)) : null } catch { /* partial editor */ }
+
+    let ms = null
+    try {
+      const last = readFileSync(stFile, 'utf8').trim().split('\n').at(-1)
+      const t = last?.match(/^([\d.]+)/)
+      if (t) ms = Math.round(Number(t[1]))
+    } catch { /* no log */ }
+
+    return {
+      entry, legacy, manager: scout.manager,
+      nvim: dumped?.nvim ?? null, ms, aborted,
+      errors, notices,
+      plugins_loaded: dumped?.plugins_loaded ?? [],
+      provisioned, unprovisioned,
+    }
+  } finally {
+    try { rmSync(work, { recursive: true, force: true }) } catch { /* best effort */ }
+  }
+}
+
+// ── report ─────────────────────────────────────────────────────────────────
+function summarize(res) {
+  const lines = []
+  if (res.skip) return { ok: true, lines: [`vim.pro check: skipped — ${res.skip}`] }
+  lines.push(`vim.pro check · ${res.entry}${res.manager ? ` · plugins via ${res.manager}` : ''}`)
+  if (res.provisioned?.length) lines.push(`  provisioned ${res.provisioned.length} plugin${res.provisioned.length === 1 ? '' : 's'} for the boot`)
+  if (res.unprovisioned?.length) lines.push(`  ⚠ could not provision: ${res.unprovisioned.join(', ')}`)
+  if (res.aborted) {
+    lines.push(`  ✕ FAILS TO BOOT on a clean machine — init aborted`)
+  } else if (res.errors.length) {
+    lines.push(`  ✕ boots with ${res.errors.length} error${res.errors.length === 1 ? '' : 's'} (${res.ms}ms on nvim ${res.nvim})`)
+  } else {
+    lines.push(`  ▲ boots clean in ${res.ms}ms on nvim ${res.nvim} · ${res.plugins_loaded.length} plugins load`)
+  }
+  for (const e of res.errors) lines.push('    ' + e.split('\n').join('\n    '))
+  const failed = res.aborted || (FAIL_ON === 'error' && res.errors.length > 0)
+  return { ok: !failed, lines }
+}
+
+const isMain = process.argv[1] && import.meta.url.endsWith(process.argv[1].split('/').pop())
+if (isMain) {
+  const res = await runCheck()
+  const { ok, lines } = summarize(res)
+  console.log(lines.join('\n'))
+  // GitHub annotations + job summary, when running as an Action
+  if (process.env.GITHUB_STEP_SUMMARY) {
+    const md = ['### vim.pro check', '', ...lines.map((l) => l.trim() ? `- ${l.trim()}` : '')].join('\n')
+    try { appendFileSync(process.env.GITHUB_STEP_SUMMARY, md + '\n') } catch { /* best effort */ }
+  }
+  if (!ok) {
+    for (const e of res.errors ?? []) console.log(`::error title=vim.pro check::${e.split('\n')[0]}`)
+    process.exit(1)
+  }
+}
