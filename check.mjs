@@ -223,7 +223,7 @@ export async function runCheck(root = ROOT) {
     if (legacy) args.push('-u', join(root, entry))
     args.push('-c', `luafile ${dump}`, '-c', 'qa!')
 
-    const r = spawnSync('nvim', args, {
+    const boot = () => spawnSync('nvim', args, {
       timeout: TIMEOUT, killSignal: 'SIGKILL', encoding: 'utf8', maxBuffer: 8 << 20,
       env: {
         PATH: process.env.PATH, HOME: work, TMPDIR: work, TERM: 'dumb', LANG: 'C.UTF-8',
@@ -231,10 +231,42 @@ export async function runCheck(root = ROOT) {
         XDG_STATE_HOME: join(work, 'state'), XDG_CACHE_HOME: join(work, 'cache'),
       },
     })
+    const bootMs = () => {
+      try {
+        const last = readFileSync(stFile, 'utf8').trim().split('\n').at(-1)
+        const t = last?.match(/^([\d.]+)/)
+        if (t) return Math.round(Number(t[1]))
+      } catch { /* no log */ }
+      return null
+    }
+
+    // THE FIRST BOOT IS SETUP, NOT THE MEASUREMENT. A config legitimately does
+    // one-time work on a fresh machine — fetching locked revisions, compiling
+    // parsers, downloading a plugin's binary — and ThePrimeagen's "29-second
+    // startup" in the corpus was mostly that. Boot once to let it settle (the
+    // cost is reported separately), then measure the boots that describe every
+    // day after, and take their median — one warm sample still wobbles.
+    let r = boot()
     if (r.error?.code === 'ENOENT') return { skip: 'nvim is not installed on this runner' }
     if (r.error?.code === 'ETIMEDOUT' || r.signal) {
       return { entry, manager: scout.manager, provisioned, unprovisioned, aborted: true,
         errors: [`the editor did not finish booting within ${Math.round(TIMEOUT / 1000)}s`], notices: [] }
+    }
+    const first_ms = bootMs()
+    // a dead init fails identically warm — report the boot that failed
+    const firstAborted = classifyStderr(String(r.stderr ?? ''))
+      .errors.some((e) => /E5113|Error detected while processing|E5108/.test(e))
+    let ms = first_ms
+    if (!firstAborted) {
+      const warm = []
+      for (let i = 0; i < 3; i++) {
+        const w = boot()
+        if (w.error || w.signal) break   // keep what we have
+        warm.push({ r: w, ms: bootMs() })
+      }
+      const timed = warm.filter((w) => w.ms !== null)
+      if (warm.length) r = warm[warm.length - 1].r   // steady state speaks
+      if (timed.length) ms = timed.map((w) => w.ms).sort((a, b) => a - b)[Math.floor((timed.length - 1) / 2)]
     }
 
     // both spellings of both roots: macOS reports /private/var for paths that
@@ -252,16 +284,9 @@ export async function runCheck(root = ROOT) {
     let dumped = null
     try { dumped = marker ? JSON.parse(marker.slice('VIMPRO_CHECK '.length)) : null } catch { /* partial editor */ }
 
-    let ms = null
-    try {
-      const last = readFileSync(stFile, 'utf8').trim().split('\n').at(-1)
-      const t = last?.match(/^([\d.]+)/)
-      if (t) ms = Math.round(Number(t[1]))
-    } catch { /* no log */ }
-
     return {
       entry, legacy, manager: scout.manager,
-      nvim: dumped?.nvim ?? null, ms, aborted,
+      nvim: dumped?.nvim ?? null, ms, first_ms, aborted,
       errors, notices,
       plugins_loaded: dumped?.plugins_loaded ?? [],
       provisioned, unprovisioned,
@@ -284,6 +309,10 @@ function summarize(res) {
     lines.push(`  ✕ boots with ${res.errors.length} error${res.errors.length === 1 ? '' : 's'} (${res.ms}ms on nvim ${res.nvim})`)
   } else {
     lines.push(`  ▲ boots clean in ${res.ms}ms on nvim ${res.nvim} · ${res.plugins_loaded.length} plugins load`)
+    // one-time setup that dwarfs the steady state is worth a line of its own
+    if (res.first_ms && res.ms && res.first_ms > 2 * res.ms + 500) {
+      lines.push(`    first boot ${res.first_ms}ms — one-time setup, not counted`)
+    }
   }
   for (const e of res.errors) lines.push('    ' + e.split('\n').join('\n    '))
   const failed = res.aborted || (FAIL_ON === 'error' && res.errors.length > 0)
