@@ -33,7 +33,7 @@ runs:
       with:
         neovim: true
         version: ${{ inputs.nvim-version }}
-    - run: node "$GITHUB_ACTION_PATH/check.mjs" "$GITHUB_WORKSPACE"
+    - run: nvim --clean -l "$GITHUB_ACTION_PATH/check.lua" "$GITHUB_WORKSPACE"
       shell: bash
       env:
         VIMPRO_CHECK_FAIL_ON: ${{ inputs.fail-on }}

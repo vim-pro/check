@@ -43,5 +43,7 @@ Options:
 ```
 
 The engine is the same one [vim.pro](https://vim.pro) uses to boot every
-connected config. Run it locally too: `node check.mjs` from your dotfiles
-root, with `nvim` and `git` on your PATH. No dependencies.
+connected config. Run it locally too: `nvim --clean -l check.lua` from your
+dotfiles root, with `nvim` (0.10+) and `git` on your PATH. Written in Lua and
+run by nvim itself — the check's only dependency is the thing it tests, and
+the editor under test is exactly the editor doing the testing.

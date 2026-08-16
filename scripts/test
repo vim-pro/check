@@ -10,10 +10,10 @@ fail=0
 mk() { mkdir -p "$tmp/$1/nvim"; printf '%s\n' "$2" > "$tmp/$1/nvim/init.lua"; }
 
 mk good 'vim.opt.number = true'
-( cd "$tmp/good" && node "$root/check.mjs" . ) || { echo 'FAIL: clean config should pass'; fail=1; }
+( cd "$tmp/good" && nvim --clean -l "$root/check.lua" . ) || { echo 'FAIL: clean config should pass'; fail=1; }
 
 mk bad "require('module_that_cannot_exist_anywhere')"
-if ( cd "$tmp/bad" && node "$root/check.mjs" . ) > "$tmp/bad.out" 2>&1; then
+if ( cd "$tmp/bad" && nvim --clean -l "$root/check.lua" . ) > "$tmp/bad.out" 2>&1; then
   echo 'FAIL: an aborted init should fail the build'; fail=1
 else
   grep -q 'FAILS TO BOOT' "$tmp/bad.out" || { echo 'FAIL: the failure should say so plainly'; fail=1; }
@@ -21,7 +21,7 @@ else
 fi
 
 mkdir -p "$tmp/none"; echo hi > "$tmp/none/README.md"
-( cd "$tmp/none" && node "$root/check.mjs" . ) | grep -q 'skipped' || { echo 'FAIL: no config should skip, not fail'; fail=1; }
+( cd "$tmp/none" && nvim --clean -l "$root/check.lua" . ) | grep -q 'skipped' || { echo 'FAIL: no config should skip, not fail'; fail=1; }
 
 [ "$fail" = 0 ] && echo 'ok — pass, fail, and skip all behave'
 exit "$fail"
