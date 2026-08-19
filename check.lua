@@ -473,7 +473,10 @@ local function run_check(root)
         unprovisioned = unprovisioned, aborted = true,
         errors = { r.spawn_failed and 'the editor could not be started'
           or 'the editor did not finish booting within ' .. math.floor(TIMEOUT / 1000 + 0.5) .. 's' },
-        notices = {} }
+        notices = {},
+        -- the kept tree must be reported on EVERY return, or the driver
+        -- cannot clean up what KEEP kept
+        work = DRIVER.keep and work or nil }
     end
     local first_ms = boot_ms()
     -- a dead init fails identically warm — report the boot that failed
