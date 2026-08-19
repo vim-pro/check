@@ -348,8 +348,12 @@ end
 local function run_check(root)
   root = uv.fs_realpath(root or '.') or root
   local paths = walk(root)
+  -- legacy = a bare vimrc name (dot and g optional), at root or under a dir —
+  -- suffix-matching alone would call 'myvimrc' legacy, which the walk never
+  -- produces but a driver-supplied entry could
   local found = DRIVER.entry and { entry = DRIVER.entry,
-    legacy = (DRIVER.entry:match('%.?g?vimrc$') and not DRIVER.entry:match('init%.[lv][ui][am]$')) and true or false }
+    legacy = ((DRIVER.entry:match('^%.?g?vimrc$') or DRIVER.entry:match('/%.?g?vimrc$'))
+      and not DRIVER.entry:match('init%.[lv][ui][am]$')) and true or false }
     or find_entry(paths)
   if not found then return { skip = 'no vim config found in this repository' } end
   local entry, legacy = found.entry, found.legacy
