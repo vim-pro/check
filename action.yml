@@ -9,11 +9,17 @@
 #         - uses: actions/checkout@v4
 #         - uses: vim-pro/check@v1
 #
-# Boots your nvim config on the runner — a genuinely clean machine — with your
+# Boots your config on the runner — a genuinely clean machine — with your
 # declared plugins provisioned, and fails the build if the editor fails. The
 # error that stops your init is quoted in the annotation, not summarized.
+#
+# `editor: vim` boots a vimrc in real Vim instead (a vimrc full of options
+# nvim removed is still legal Vim, and the verdict should answer the question
+# its author actually lives with); `editor: both` reports both — clean in
+# Vim, four errors in Neovim is a fact about one config that nothing else
+# surfaces. Neovim is always installed: it runs the check itself.
 name: 'vim.pro check'
-description: 'Boot your nvim config on a clean machine and fail the build if the editor fails.'
+description: 'Boot your vim/nvim config on a clean machine and fail the build if the editor fails.'
 branding:
   icon: 'check-circle'
   color: 'green'
@@ -22,6 +28,14 @@ inputs:
     description: 'Neovim version to boot with (stable, nightly, or a tag like v0.12.4)'
     required: false
     default: 'stable'
+  vim-version:
+    description: 'Vim version to boot with when editor is vim/both (stable or a tag)'
+    required: false
+    default: 'stable'
+  editor:
+    description: 'Which editor boots the config: "nvim", "vim", or "both"'
+    required: false
+    default: 'nvim'
   fail-on:
     description: 'What fails the build: "error" (any init error) or "abort" (only a dead init)'
     required: false
@@ -33,7 +47,13 @@ runs:
       with:
         neovim: true
         version: ${{ inputs.nvim-version }}
+    - if: ${{ inputs.editor != 'nvim' }}
+      uses: rhysd/action-setup-vim@v1
+      with:
+        neovim: false
+        version: ${{ inputs.vim-version }}
     - run: nvim --clean -l "$GITHUB_ACTION_PATH/check.lua" "$GITHUB_WORKSPACE"
       shell: bash
       env:
         VIMPRO_CHECK_FAIL_ON: ${{ inputs.fail-on }}
+        VIMPRO_CHECK_EDITOR: ${{ inputs.editor }}

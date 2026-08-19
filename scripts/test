@@ -35,5 +35,21 @@ printf 'E5113: broken thing\nDownloading something\n' \
   | nvim --clean -l "$root/check.lua" --classify | grep -q '"E5113: broken thing"' \
   || { echo 'FAIL: --classify should classify stdin'; fail=1; }
 
+# real Vim, where this runner has one: a vimrc that is legal Vim and illegal
+# nvim must boot clean under editor=vim and error under the default
+if command -v vim >/dev/null 2>&1; then
+  mkdir -p "$tmp/legacy"; printf 'set number\nset pastetoggle=<F2>\n' > "$tmp/legacy/.vimrc"
+  ( cd "$tmp/legacy" && VIMPRO_CHECK_EDITOR=vim nvim --clean -l "$root/check.lua" . ) | grep -q 'boots clean.*on vim' \
+    || { echo 'FAIL: legal Vim should boot clean in real Vim'; fail=1; }
+  if ( cd "$tmp/legacy" && nvim --clean -l "$root/check.lua" . ) > "$tmp/legacy.out" 2>&1; then
+    echo 'FAIL: pastetoggle should error under nvim'; fail=1
+  else
+    grep -q 'E519' "$tmp/legacy.out" || { echo 'FAIL: the nvim error should be quoted'; fail=1; }
+  fi
+  # an nvim-only config under editor=vim skips honestly instead of failing
+  ( cd "$tmp/good" && VIMPRO_CHECK_EDITOR=vim nvim --clean -l "$root/check.lua" . ) | grep -q 'skipped' \
+    || { echo 'FAIL: no vimrc + editor=vim should skip'; fail=1; }
+fi
+
 [ "$fail" = 0 ] && echo 'ok — pass, fail, and skip all behave'
 exit "$fail"

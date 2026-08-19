@@ -55,6 +55,12 @@ local uv = vim.uv
 local TIMEOUT = tonumber(os.getenv('VIMPRO_CHECK_TIMEOUT_MS') or '') or 60000
 -- fail-on: 'abort' (only a dead init fails) or 'error' (any init error fails)
 local FAIL_ON = os.getenv('VIMPRO_CHECK_FAIL_ON') == 'abort' and 'abort' or 'error'
+-- editor: 'nvim' (default), 'vim' (boot the vimrc in real Vim), or 'both'.
+-- A vimrc valid in Vim can be full of options nvim removed — tpope's
+-- pastetoggle is legal Vim — so for a Vim loyalist the nvim verdict answers
+-- the wrong question, and 'both' surfaces a fact nobody else does: clean in
+-- Vim, four errors in Neovim, one config.
+local EDITOR = ({ vim = 'vim', both = 'both' })[os.getenv('VIMPRO_CHECK_EDITOR') or ''] or 'nvim'
 
 -- the driver hooks, read once
 local DRIVER = {
@@ -345,7 +351,8 @@ local function run_process(argv, opts)
 end
 
 -- ── the check ──────────────────────────────────────────────────────────────
-local function run_check(root)
+local function run_check(root, editor)
+  editor = editor or 'nvim'
   root = uv.fs_realpath(root or '.') or root
   local paths = walk(root)
   -- legacy = a bare vimrc name (dot and g optional), at root or under a dir —
@@ -357,6 +364,11 @@ local function run_check(root)
     or find_entry(paths)
   if not found then return { skip = 'no vim config found in this repository' } end
   local entry, legacy = found.entry, found.legacy
+  -- real Vim boots a vimrc; an init.lua config has nothing for it to run,
+  -- and saying so beats booting the wrong editor's config
+  if editor == 'vim' and not legacy then
+    return { skip = 'no vimrc for real Vim here — the config is ' .. entry .. ' (nvim)' }
+  end
 
   -- driver mode trusts its caller: the site's parser already identified the
   -- entry and read the declarations properly, and the scout must not overrule
@@ -372,16 +384,27 @@ local function run_check(root)
     local xdg_config = join(work, 'config')
     vim.fn.mkdir(xdg_config, 'p')
     if not legacy then uv.fs_symlink(join(root, dirname(entry)), join(xdg_config, 'nvim')) end
+    -- a legacy config's runtime lives in .vim beside the vimrc — Vim reads
+    -- ~/.vim, and the scratch HOME must offer the repo's, or every pathogen-
+    -- era bundle and pack/ package is invisible to the boot
+    if uv.fs_stat(join(root, '.vim')) then
+      uv.fs_symlink(join(root, '.vim'), join(work, '.vim'))
+    end
 
     -- native packages: make sure the config dir's submodules are actually
     -- present — on a fresh CI checkout they are not, unless the workflow asked
-    -- for them. Shallow first, full on failure, https whatever .gitmodules says.
-    if uv.fs_stat(join(root, '.gitmodules')) and not legacy then
+    -- for them. Shallow first, full on failure, https whatever .gitmodules
+    -- says. A legacy config's submodules live under .vim (the repo root IS
+    -- the config dir, and scoping to '.' would fetch the whole dotfiles
+    -- repo's tmux and shell submodules for nothing).
+    local sub_scope = not legacy and dirname(entry)
+      or (uv.fs_stat(join(root, '.vim')) and '.vim' or nil)
+    if uv.fs_stat(join(root, '.gitmodules')) and sub_scope then
       local function sub(extra)
         local args = { '-c', 'url.https://github.com/.insteadOf=git@github.com:',
           '-C', root, 'submodule', 'update', '--init', '--jobs', '4' }
         vim.list_extend(args, extra)
-        vim.list_extend(args, { '--', dirname(entry) })
+        vim.list_extend(args, { '--', sub_scope })
         return git(args, { timeout_ms = 180000 })
       end
       local sm = sub({ '--depth', '1' })
@@ -415,11 +438,22 @@ local function run_check(root)
     local dump = join(work, 'dump.lua')
     write_file(dump, DUMP_LUA)
     local st_file = join(work, 'startuptime.log')
-    -- the editor under test is EXACTLY the editor running this script
-    local nvim_args = { vim.v.progpath, '--headless', '-n', '-i', 'NONE', '--startuptime', st_file,
-      '--cmd', 'set shell=/bin/false shellcmdflag=' }
-    if legacy then vim.list_extend(nvim_args, { '-u', join(root, entry) }) end
-    vim.list_extend(nvim_args, { '-c', 'luafile ' .. dump, '-c', 'qa!' })
+    local editor_args
+    if editor == 'vim' then
+      -- real Vim, silent batch mode. No lua dump: what a vim boot can attest
+      -- is its clock and its stderr, and claiming more would be invented.
+      local vim_bin = vim.fn.exepath('vim')
+      if vim_bin == '' then return { skip = 'vim is not installed on this runner' } end
+      editor_args = { vim_bin, '-es', '--not-a-term', '-i', 'NONE', '--startuptime', st_file,
+        '--cmd', 'set shell=/bin/false shellcmdflag=',
+        '-u', join(root, entry), '-c', 'qa!' }
+    else
+      -- the editor under test is EXACTLY the editor running this script
+      editor_args = { vim.v.progpath, '--headless', '-n', '-i', 'NONE', '--startuptime', st_file,
+        '--cmd', 'set shell=/bin/false shellcmdflag=' }
+      if legacy then vim.list_extend(editor_args, { '-u', join(root, entry) }) end
+      vim.list_extend(editor_args, { '-c', 'luafile ' .. dump, '-c', 'qa!' })
+    end
 
     -- the sandbox policy wraps the argv; the work tree is the one dynamic bind
     local argv = {}
@@ -427,7 +461,7 @@ local function run_check(root)
       vim.list_extend(argv, DRIVER.sandbox)
       vim.list_extend(argv, { '--bind', work, work })
     end
-    vim.list_extend(argv, nvim_args)
+    vim.list_extend(argv, editor_args)
 
     local boot_env = {
       PATH = os.getenv('PATH'), HOME = work, TMPDIR = work, TERM = 'dumb', LANG = 'C.UTF-8',
@@ -479,11 +513,16 @@ local function run_check(root)
         work = DRIVER.keep and work or nil }
     end
     local first_ms = boot_ms()
-    -- a dead init fails identically warm — report the boot that failed
+    -- a dead init fails identically warm — report the boot that failed.
+    -- Real Vim never takes this path: a vimscript error is per-line, the
+    -- init CONTINUES, and 'Error detected while processing' is Vim saying
+    -- where, not Vim dying.
     local first_aborted = false
-    for _, e in ipairs(classify_stderr(r.stderr).errors) do
-      if e:match('E5113') or e:match('Error detected while processing') or e:match('E5108') then
-        first_aborted = true
+    if editor ~= 'vim' then
+      for _, e in ipairs(classify_stderr(r.stderr).errors) do
+        if e:match('E5113') or e:match('Error detected while processing') or e:match('E5108') then
+          first_aborted = true
+        end
       end
     end
     local ms = first_ms
@@ -516,14 +555,23 @@ local function run_check(root)
     end
     local classified = classify_stderr(scrubbed)
     local aborted = false
-    for _, e in ipairs(classified.errors) do
-      if e:match('^E5113') or e:match('Error detected while processing') or e:match('^E5108') then
-        aborted = true
+    if editor ~= 'vim' then
+      for _, e in ipairs(classified.errors) do
+        if e:match('^E5113') or e:match('Error detected while processing') or e:match('^E5108') then
+          aborted = true
+        end
       end
     end
     local marker = (r.stdout or ''):match('.*VIMPRO_CHECK ([^\n]*)')
     local ok_dump, dumped = pcall(vim.json.decode, marker or '')
     if not ok_dump then dumped = nil end
+    -- what to call the editor on the report line. Vim has no dump (no lua
+    -- guarantee), so its version comes from --version.
+    local editor_version = dumped and dumped.nvim or nil
+    if editor == 'vim' then
+      local v = run_process({ vim.fn.exepath('vim'), '--version' }, { env = { PATH = os.getenv('PATH') }, timeout = 10000 })
+      editor_version = (v.stdout or ''):match('Vi IMproved (%d+%.%d+)') or '?'
+    end
 
     local scrub = function(text)
       local t = tostring(text or '')
@@ -535,7 +583,8 @@ local function run_check(root)
       return t
     end
     return {
-      entry = entry, legacy = legacy, manager = scout.manager,
+      entry = entry, legacy = legacy, manager = scout.manager, editor = editor,
+      editor_version = editor_version,
       nvim = dumped and dumped.nvim or nil, ms = ms, first_ms = first_ms, aborted = aborted,
       errors = classified.errors, notices = classified.notices,
       plugins_loaded = dumped and dumped.plugins_loaded or {},
@@ -569,14 +618,18 @@ local function summarize(res)
   if #res.unprovisioned > 0 then
     lines[#lines + 1] = '  ⚠ could not provision: ' .. table.concat(res.unprovisioned, ', ')
   end
+  local ed = (res.editor or 'nvim') .. ' ' .. tostring(res.editor_version or res.nvim)
   if res.aborted then
     lines[#lines + 1] = '  ✕ FAILS TO BOOT on a clean machine — init aborted'
   elseif #res.errors > 0 then
-    lines[#lines + 1] = ('  ✕ boots with %d error%s (%sms on nvim %s)')
-      :format(#res.errors, plural(#res.errors), tostring(res.ms), tostring(res.nvim))
+    lines[#lines + 1] = ('  ✕ boots with %d error%s (%sms on %s)')
+      :format(#res.errors, plural(#res.errors), tostring(res.ms), ed)
   else
-    lines[#lines + 1] = ('  ▲ boots clean in %sms on nvim %s · %d plugins load')
-      :format(tostring(res.ms), tostring(res.nvim), #res.plugins_loaded)
+    -- a vim boot has no lua dump, so it claims its clock and nothing more
+    lines[#lines + 1] = res.editor == 'vim'
+      and ('  ▲ boots clean in %sms on %s'):format(tostring(res.ms), ed)
+      or ('  ▲ boots clean in %sms on %s · %d plugins load')
+        :format(tostring(res.ms), ed, #res.plugins_loaded)
     -- one-time setup that dwarfs the steady state is worth a line of its own
     if res.first_ms and res.ms and res.first_ms > 2 * res.ms + 500 then
       lines[#lines + 1] = ('    first boot %dms — one-time setup, not counted'):format(res.first_ms)
@@ -598,27 +651,32 @@ if _G.arg and _G.arg[1] == '--classify' then
   os.exit(0)
 end
 
-local res = run_check(_G.arg and _G.arg[1] or '.')
-local sum = summarize(res)
-io.stdout:write(table.concat(sum.lines, '\n') .. '\n')
-if DRIVER.json then
-  io.stdout:write('VIMPRO_CHECK_RESULT ' .. vim.json.encode(res) .. '\n')
-end
--- GitHub annotations + job summary, when running as an Action
-local step_summary = os.getenv('GITHUB_STEP_SUMMARY')
-if step_summary then
-  local md = { '### vim.pro check', '' }
-  for _, l in ipairs(sum.lines) do
-    local t = l:gsub('^%s+', ''):gsub('%s+$', '')
-    md[#md + 1] = t ~= '' and ('- ' .. t) or ''
+local editors = EDITOR == 'both' and { 'nvim', 'vim' } or { EDITOR }
+local failed = false
+for _, ed in ipairs(editors) do
+  local res = run_check(_G.arg and _G.arg[1] or '.', ed)
+  local sum = summarize(res)
+  io.stdout:write(table.concat(sum.lines, '\n') .. '\n')
+  if DRIVER.json then
+    io.stdout:write('VIMPRO_CHECK_RESULT ' .. vim.json.encode(res) .. '\n')
   end
-  local f = io.open(step_summary, 'a')
-  if f then f:write(table.concat(md, '\n') .. '\n'); f:close() end
-end
-if not sum.ok then
-  for _, e in ipairs(res.errors or {}) do
-    io.stdout:write('::error title=vim.pro check::'
-      .. e:gsub('%%', '%%25'):gsub('\n', '%%0A') .. '\n')
+  -- GitHub annotations + job summary, when running as an Action
+  local step_summary = os.getenv('GITHUB_STEP_SUMMARY')
+  if step_summary then
+    local md = { '### vim.pro check' .. (#editors > 1 and (' · ' .. ed) or ''), '' }
+    for _, l in ipairs(sum.lines) do
+      local t = l:gsub('^%s+', ''):gsub('%s+$', '')
+      md[#md + 1] = t ~= '' and ('- ' .. t) or ''
+    end
+    local f = io.open(step_summary, 'a')
+    if f then f:write(table.concat(md, '\n') .. '\n'); f:close() end
   end
-  os.exit(1)
+  if not sum.ok then
+    failed = true
+    for _, e in ipairs(res.errors or {}) do
+      io.stdout:write('::error title=vim.pro check' .. (#editors > 1 and (' (' .. ed .. ')') or '') .. '::'
+        .. e:gsub('%%', '%%25'):gsub('\n', '%%0A') .. '\n')
+    end
+  end
 end
+if failed then os.exit(1) end

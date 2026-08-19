@@ -39,8 +39,15 @@ Options:
 - uses: vim-pro/check@v1
   with:
     nvim-version: nightly   # default: stable — run both jobs to get early warning
+    editor: both            # default: nvim — 'vim' boots your vimrc in real Vim,
+                            # 'both' reports both editors' verdicts
     fail-on: abort          # default: error — 'abort' only fails a dead init
 ```
+
+A vimrc full of options nvim removed is still legal Vim — `editor: vim`
+answers the question its author actually lives with, and `editor: both`
+surfaces a fact nothing else does: the same config, clean in Vim, erroring
+in Neovim (or the reverse). A repo with no vimrc skips the Vim row honestly.
 
 The engine is the same one [vim.pro](https://vim.pro) uses to boot every
 connected config. Run it locally too: `nvim --clean -l check.lua` from your
