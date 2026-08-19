@@ -23,5 +23,17 @@ fi
 mkdir -p "$tmp/none"; echo hi > "$tmp/none/README.md"
 ( cd "$tmp/none" && nvim --clean -l "$root/check.lua" . ) | grep -q 'skipped' || { echo 'FAIL: no config should skip, not fail'; fail=1; }
 
+# driver mode — the seam vim.pro's worker drives: a JSON result line, and the
+# work tree kept for the caller (who captures the portrait there, then cleans)
+out="$(cd "$tmp/good" && VIMPRO_CHECK_JSON=1 VIMPRO_CHECK_KEEP=1 nvim --clean -l "$root/check.lua" .)"
+echo "$out" | grep -q 'VIMPRO_CHECK_RESULT {' || { echo 'FAIL: driver mode should print the JSON result'; fail=1; }
+work="$(printf '%s' "$out" | sed -n 's/.*"work":"\([^"]*\)".*/\1/p')"
+if [ -n "$work" ] && [ -d "$work" ]; then rm -rf "$work"; else echo 'FAIL: KEEP should keep the work tree'; fail=1; fi
+
+# the classify seam: stderr in, the classification out, as JSON
+printf 'E5113: broken thing\nDownloading something\n' \
+  | nvim --clean -l "$root/check.lua" --classify | grep -q '"E5113: broken thing"' \
+  || { echo 'FAIL: --classify should classify stdin'; fail=1; }
+
 [ "$fail" = 0 ] && echo 'ok — pass, fail, and skip all behave'
 exit "$fail"
